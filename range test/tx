@@ -1,0 +1,111 @@
+/*
+  ============================================================================
+   LoRa RANGE TEST  -  TRANSMITTER  (the board you carry around)
+  ============================================================================
+   Board  : Waveshare RP2040-LoRa-HF  (Tools > Board > "Waveshare RP2040 LoRa")
+   Library: RadioLib
+   Wiring : nothing extra - just the antenna + USB power / power bank
+
+   Sends a tiny numbered "ping" packet every PING_INTERVAL_MS.
+   The receiver uses the number to work out how many packets were lost.
+   On-board LED flashes on every transmission.
+  ============================================================================
+*/
+
+#include <SPI.h>
+#include <RadioLib.h>
+
+// ============================ USER SETTINGS =================================
+#define PING_INTERVAL_MS  1000UL     // one ping per second (must match receiver)
+
+// ---- LoRa settings: MUST be identical on transmitter and receiver ----
+#define LORA_FREQ_MHZ     866.0      // India IN865 band: 865-867 MHz
+#define LORA_BW_KHZ       125.0
+#define LORA_SF           9          // try 10-12 for more range (slower)
+#define LORA_CR           7
+#define LORA_SYNC_WORD    0x12
+#define LORA_TX_DBM       22         // full power for range testing (2..22)
+#define LORA_PREAMBLE     8
+// ============================================================================
+
+// ---- RP2040-LoRa on-board radio wiring (fixed) ----
+#define LORA_SCK   14
+#define LORA_MOSI  15
+#define LORA_MISO  24
+#define LORA_CS    13
+#define LORA_RST   23
+#define LORA_BUSY  18
+#define LORA_DIO1  16
+#define LORA_RXEN  17
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 25
+#endif
+
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI1);
+
+// ---- Packet (must match receiver) ----
+struct __attribute__((packed)) PingPacket {
+  uint8_t  magic[2];   // 'R','T'
+  uint32_t counter;
+  int8_t   txPower;    // dBm, shown on the receiver
+  uint8_t  sf;         // spreading factor, shown on the receiver
+};
+
+uint32_t counter = 0;
+
+bool radioBegin() {
+  SPI1.setRX(LORA_MISO);
+  SPI1.setSCK(LORA_SCK);
+  SPI1.setTX(LORA_MOSI);
+  SPI1.begin();
+
+  int state = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                          LORA_SYNC_WORD, LORA_TX_DBM, LORA_PREAMBLE, 0.0, false);
+  if (state != RADIOLIB_ERR_NONE) {
+    state = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                        LORA_SYNC_WORD, LORA_TX_DBM, LORA_PREAMBLE, 1.8, false);
+  }
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] init FAILED, code %d\n", state);
+    return false;
+  }
+  radio.setDio2AsRfSwitch(true);
+  radio.setRfSwitchPins(LORA_RXEN, RADIOLIB_NC);
+  return true;
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 2000) { }   // don't wait long: usually on a power bank
+
+  Serial.println(F("\n=== LoRa RANGE TEST - TRANSMITTER ==="));
+  if (!radioBegin()) {
+    while (true) { digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); delay(100); }
+  }
+  Serial.printf("Sending ping every %lu ms  |  %.1f MHz  SF%d  BW%.0f  %d dBm\n",
+                (unsigned long)PING_INTERVAL_MS, LORA_FREQ_MHZ, LORA_SF, LORA_BW_KHZ, LORA_TX_DBM);
+}
+
+void loop() {
+  static uint32_t lastPing = 0;
+  if (counter != 0 && millis() - lastPing < PING_INTERVAL_MS) return;
+  lastPing = millis();
+
+  PingPacket p;
+  p.magic[0] = 'R';
+  p.magic[1] = 'T';
+  p.counter  = counter;
+  p.txPower  = LORA_TX_DBM;
+  p.sf       = LORA_SF;
+
+  digitalWrite(LED_BUILTIN, HIGH);
+  int state = radio.transmit((uint8_t *)&p, sizeof(p));
+  digitalWrite(LED_BUILTIN, LOW);
+
+  if (state == RADIOLIB_ERR_NONE) Serial.printf("ping #%lu sent\n", (unsigned long)counter);
+  else                            Serial.printf("ping #%lu TX error %d\n", (unsigned long)counter, state);
+  counter++;
+}
