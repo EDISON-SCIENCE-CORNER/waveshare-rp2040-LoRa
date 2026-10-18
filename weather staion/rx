@@ -1,0 +1,362 @@
+/*
+  ============================================================================
+   LoRa Weather Station  -  RECEIVER  (indoor display)
+  ============================================================================
+   Board  : Waveshare RP2040-LoRa-HF  (RP2040 + SX1262)
+   Core   : "Raspberry Pi Pico/RP2040" by Earle F. Philhower (arduino-pico)
+            Tools > Board > Raspberry Pi RP2040 Boards > "Waveshare RP2040 LoRa"
+            ("Raspberry Pi Pico" also works)
+   Library: RadioLib (by Jan Gromes)  +  U8g2 (by olikraus)
+   Display: 1.3" I2C OLED 128x64 (SH1106 controller, address 0x3C)
+
+   Wiring  (OLED  ->  RP2040-LoRa)
+   -------------------------------
+     VCC  ->  3V3
+     GND  ->  GND
+     SDA  ->  GP4
+     SCL  ->  GP5
+
+   One dashboard screen with every reading in its own box:
+     top row    : TEMP | HUMIDITY
+     middle row : AQI  | TVOC | eCO2
+     bottom line: RSSI, SNR and time since the last packet
+                  (turns into an inverted "NO SIGNAL" bar if packets stop)
+   Every packet is also printed on USB Serial as CSV (easy to log on a PC).
+  ============================================================================
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <RadioLib.h>
+#include <U8g2lib.h>
+
+// ============================ USER SETTINGS =================================
+// ---- LoRa settings: MUST be identical on transmitter and receiver ----
+#define LORA_FREQ_MHZ     866.0      // India IN865 band: 865-867 MHz
+#define LORA_BW_KHZ       125.0
+#define LORA_SF           9
+#define LORA_CR           7
+#define LORA_SYNC_WORD    0x12
+#define LORA_TX_DBM       17         // receiver doesn't transmit, but begin() needs it
+#define LORA_PREAMBLE     8
+
+#define SIGNAL_LOST_MS    35000UL    // > 3 missed packets at 10 s interval
+
+// I2C pins for the OLED
+#define I2C_SDA           4
+#define I2C_SCL           5
+// ============================================================================
+
+// 1.3" OLEDs almost always use the SH1106 chip.
+// If yours shows a shifted/garbled image, it's an SSD1306: swap the two lines.
+U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+// U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+
+// ---- RP2040-LoRa on-board radio wiring (fixed, do not change) ----
+#define LORA_SCK   14
+#define LORA_MOSI  15
+#define LORA_MISO  24
+#define LORA_CS    13
+#define LORA_RST   23
+#define LORA_BUSY  18
+#define LORA_DIO1  16
+#define LORA_RXEN  17   // antenna switch: HIGH = receive, LOW = transmit
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 25
+#endif
+
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI1);
+
+// ---- Packet format (must match the transmitter) ----
+struct __attribute__((packed)) WeatherPacket {
+  uint8_t  magic[2];    // 'W','X'
+  uint8_t  version;     // 1
+  uint8_t  nodeId;
+  uint16_t counter;
+  int16_t  temp_c100;   // degC * 100
+  uint16_t hum_p100;    // %RH * 100
+  uint8_t  aqi;         // 1..5
+  uint16_t tvoc_ppb;
+  uint16_t eco2_ppm;
+  uint8_t  ensValidity; // 0 normal, 1 warm-up, 2 initial start-up, 3 invalid
+  uint8_t  flags;       // bit0 = AHT21 ok, bit1 = ENS160 ok
+};
+
+#define FLAG_AHT_OK  0x01
+#define FLAG_ENS_OK  0x02
+
+// ---- State ----
+volatile bool packetFlag = false;
+WeatherPacket last;
+bool     haveData   = false;
+uint32_t lastRxMs   = 0;
+float    lastRssi   = 0;
+float    lastSnr    = 0;
+uint32_t rxCount    = 0;
+uint32_t lostCount  = 0;
+uint32_t ledOffAt   = 0;
+
+void onPacket() { packetFlag = true; }   // called from interrupt (DIO1)
+
+// ============================================================================
+//  Helpers
+// ============================================================================
+const char *aqiText(uint8_t aqi) {
+  switch (aqi) {
+    case 1: return "Excellent";
+    case 2: return "Good";
+    case 3: return "Moderate";
+    case 4: return "Poor";
+    case 5: return "Unhealthy";
+    default: return "--";
+  }
+}
+
+void formatAge(uint32_t ms, char *out, size_t len) {
+  uint32_t s = ms / 1000;
+  if (s < 60)        snprintf(out, len, "%lus", (unsigned long)s);
+  else if (s < 3600) snprintf(out, len, "%lum", (unsigned long)(s / 60));
+  else               snprintf(out, len, "%luh", (unsigned long)(s / 3600));
+}
+
+// Draw text horizontally centred inside a box that starts at x and is w wide
+void drawCentered(int x, int w, int baseline, const char *text, bool utf8 = false) {
+  int tw = utf8 ? oled.getUTF8Width(text) : oled.getStrWidth(text);
+  int tx = x + (w - tw) / 2;
+  if (utf8) oled.drawUTF8(tx, baseline, text);
+  else      oled.drawStr(tx, baseline, text);
+}
+
+// One boxed reading: small title on top, big value in the middle,
+// optional small unit/label underneath.
+void drawBox(int x, int y, int w, int h, const char *title,
+             const char *value, const char *unit, const uint8_t *valueFont) {
+  oled.drawFrame(x, y, w, h);
+
+  oled.setFont(u8g2_font_4x6_tf);                  // title
+  oled.drawStr(x + 3, y + 7, title);
+
+  oled.setFont(valueFont);                         // value
+  int valueBaseline = unit ? y + 19 : y + h - 5;
+  drawCentered(x, w, valueBaseline, value, true);
+
+  if (unit) {                                      // unit / label
+    oled.setFont(u8g2_font_4x6_tf);
+    drawCentered(x, w, y + h - 3, unit);
+  }
+}
+
+// ============================================================================
+//  Dashboard - everything on one screen
+// ============================================================================
+//   +---------------+---------------+
+//   |TEMP           |HUMIDITY       |
+//   |    28.4°C     |    62.3%      |
+//   +----------+----+-----+---------+
+//   |AQI       |TVOC      |eCO2     |
+//   |    2     |   123    |   456   |
+//   |   Good   |   ppb    |   ppm   |
+//   +----------+----------+---------+
+//   RSSI -87 SNR 9.5                4s
+// ============================================================================
+void updateDisplay() {
+  char temp[12] = "--", hum[12] = "--";
+  char aqi[6]   = "--", tvoc[8] = "--", eco2[8] = "--";
+  const char *aqiLabel = "";
+
+  if (haveData) {
+    if (last.flags & FLAG_AHT_OK) {
+      snprintf(temp, sizeof(temp), "%.1f\xC2\xB0" "C", last.temp_c100 / 100.0f);   // "°C"
+      snprintf(hum,  sizeof(hum),  "%.1f%%", last.hum_p100 / 100.0f);
+    } else {
+      strcpy(temp, "ERR");
+      strcpy(hum,  "ERR");
+    }
+
+    if (last.flags & FLAG_ENS_OK) {
+      snprintf(aqi,  sizeof(aqi),  "%u", last.aqi);
+      snprintf(tvoc, sizeof(tvoc), "%u", last.tvoc_ppb);
+      snprintf(eco2, sizeof(eco2), "%u", last.eco2_ppm);
+      switch (last.ensValidity) {
+        case 1:  aqiLabel = "warm-up";  break;
+        case 2:  aqiLabel = "start-up"; break;
+        case 3:  aqiLabel = "invalid";  break;
+        default: aqiLabel = aqiText(last.aqi);
+      }
+    } else {
+      strcpy(aqi, "ERR");
+      strcpy(tvoc, "ERR");
+      strcpy(eco2, "ERR");
+    }
+  }
+
+  oled.clearBuffer();
+
+  // Row 1: climate (two wide boxes)
+  drawBox(0,  0, 64, 27, "TEMP",     temp, nullptr, u8g2_font_8x13B_tf);
+  drawBox(63, 0, 65, 27, "HUMIDITY", hum,  nullptr, u8g2_font_8x13B_tf);
+
+  // Row 2: air quality (three boxes)
+  drawBox(0,  26, 43, 29, "AQI",  aqi,  aqiLabel, u8g2_font_7x13B_tf);
+  drawBox(42, 26, 44, 29, "TVOC", tvoc, "ppb",    u8g2_font_7x13B_tf);
+  drawBox(85, 26, 43, 29, "eCO2", eco2, "ppm",    u8g2_font_7x13B_tf);
+
+  // Row 3: link status
+  char line[32], age[8];
+  oled.setFont(u8g2_font_5x7_tf);
+  if (!haveData) {
+    snprintf(line, sizeof(line), "Waiting... %.1fMHz SF%d", LORA_FREQ_MHZ, LORA_SF);
+    oled.drawStr(0, 63, line);
+  } else {
+    formatAge(millis() - lastRxMs, age, sizeof(age));
+    if (millis() - lastRxMs > SIGNAL_LOST_MS) {
+      snprintf(line, sizeof(line), "NO SIGNAL - last %s ago", age);
+      oled.drawBox(0, 56, 128, 8);
+      oled.setDrawColor(0);
+      drawCentered(0, 128, 63, line);
+      oled.setDrawColor(1);
+    } else {
+      snprintf(line, sizeof(line), "RSSI %d SNR %.1f", (int)lastRssi, lastSnr);
+      oled.drawStr(0, 63, line);
+      snprintf(line, sizeof(line), "%s", age);
+      oled.drawStr(128 - oled.getStrWidth(line), 63, line);
+    }
+  }
+
+  oled.sendBuffer();
+}
+
+// ============================================================================
+//  Radio
+// ============================================================================
+bool radioBegin() {
+  SPI1.setRX(LORA_MISO);
+  SPI1.setSCK(LORA_SCK);
+  SPI1.setTX(LORA_MOSI);
+  SPI1.begin();
+
+  // RP2040-LoRa uses a crystal (no TCXO) -> tcxoVoltage = 0
+  int state = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                          LORA_SYNC_WORD, LORA_TX_DBM, LORA_PREAMBLE, 0.0, false);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] begin without TCXO failed (%d), retrying with 1.8V TCXO\n", state);
+    state = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                        LORA_SYNC_WORD, LORA_TX_DBM, LORA_PREAMBLE, 1.8, false);
+  }
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] init FAILED, code %d\n", state);
+    return false;
+  }
+
+  radio.setDio2AsRfSwitch(true);
+  radio.setRfSwitchPins(LORA_RXEN, RADIOLIB_NC);
+  radio.setPacketReceivedAction(onPacket);
+
+  state = radio.startReceive();
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] startReceive FAILED, code %d\n", state);
+    return false;
+  }
+  return true;
+}
+
+void handlePacket() {
+  uint8_t buf[64];
+  size_t len = radio.getPacketLength();
+  if (len > sizeof(buf)) len = sizeof(buf);
+  int state = radio.readData(buf, len);
+
+  if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+    Serial.println(F("# CRC error (corrupted packet)"));
+  } else if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("# receive error %d\n", state);
+  } else if (len != sizeof(WeatherPacket) || buf[0] != 'W' || buf[1] != 'X') {
+    Serial.printf("# ignored foreign packet (%u bytes)\n", (unsigned)len);
+  } else {
+    WeatherPacket p;
+    memcpy(&p, buf, sizeof(p));
+
+    // count lost packets using the sequence counter
+    if (haveData && p.nodeId == last.nodeId) {
+      uint16_t gap = (uint16_t)(p.counter - last.counter);
+      if (gap > 1 && gap < 1000) lostCount += gap - 1;
+    }
+
+    last      = p;
+    haveData  = true;
+    lastRxMs  = millis();
+    lastRssi  = radio.getRSSI();
+    lastSnr   = radio.getSNR();
+    rxCount++;
+
+    digitalWrite(LED_BUILTIN, HIGH);
+    ledOffAt = millis() + 80;
+
+    // CSV: node,counter,temp,hum,aqi,tvoc,eco2,validity,rssi,snr,lost
+    Serial.printf("%u,%u,%.2f,%.1f,%u,%u,%u,%u,%.0f,%.1f,%lu\n",
+                  p.nodeId, p.counter, p.temp_c100 / 100.0f, p.hum_p100 / 100.0f,
+                  p.aqi, p.tvoc_ppb, p.eco2_ppm, p.ensValidity,
+                  lastRssi, lastSnr, (unsigned long)lostCount);
+    updateDisplay();
+  }
+
+  radio.startReceive();   // make sure we're listening again
+}
+
+// ============================================================================
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) { }
+
+  Serial.println();
+  Serial.println(F("=== LoRa Weather Station - RECEIVER ==="));
+
+  Wire.setSDA(I2C_SDA);
+  Wire.setSCL(I2C_SCL);
+  oled.setBusClock(400000);
+  oled.begin();
+
+  // splash
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_7x13B_tf);
+  oled.drawStr(8, 28, "LoRa Weather");
+  oled.drawStr(8, 44, "Station - RX");
+  oled.sendBuffer();
+  delay(1200);
+
+  if (!radioBegin()) {
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_7x13B_tf);
+    oled.drawStr(0, 28, "LoRa init FAILED");
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(0, 46, "Check Serial Monitor");
+    oled.sendBuffer();
+    while (true) { digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); delay(100); }
+  }
+
+  Serial.printf("LoRa listening on %.1f MHz, SF%d, BW%.0f kHz\n",
+                LORA_FREQ_MHZ, LORA_SF, LORA_BW_KHZ);
+  Serial.println(F("node,counter,temp_c,hum_pct,aqi,tvoc_ppb,eco2_ppm,validity,rssi_dbm,snr_db,lost"));
+  updateDisplay();
+}
+
+void loop() {
+  if (packetFlag) {
+    packetFlag = false;
+    handlePacket();
+  }
+
+  if (ledOffAt && (int32_t)(millis() - ledOffAt) >= 0) {
+    digitalWrite(LED_BUILTIN, LOW);
+    ledOffAt = 0;
+  }
+
+  static uint32_t lastDraw = 0;
+  if (millis() - lastDraw >= 250) {      // refresh 4x per second (updates the age)
+    lastDraw = millis();
+    updateDisplay();
+  }
+}
