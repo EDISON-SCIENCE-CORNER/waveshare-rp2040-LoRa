@@ -1,0 +1,330 @@
+/*
+  ============================================================================
+   LoRa Weather Station  -  TRANSMITTER  (outdoor / sensor node)
+  ============================================================================
+   Board  : Waveshare RP2040-LoRa-HF  (RP2040 + SX1262)
+   Core   : "Raspberry Pi Pico/RP2040" by Earle F. Philhower (arduino-pico)
+            Tools > Board > Raspberry Pi RP2040 Boards > "Waveshare RP2040 LoRa"
+            ("Raspberry Pi Pico" also works)
+   Library: RadioLib  (by Jan Gromes)  - install from Library Manager
+   Sensor : ENS160 + AHT21 combo module (I2C) - no extra library needed,
+            the drivers are built into this sketch.
+
+   Wiring  (sensor module  ->  RP2040-LoRa)
+   ----------------------------------------
+     VCC  ->  3V3
+     GND  ->  GND
+     SDA  ->  GP4
+     SCL  ->  GP5
+
+   What it does
+   ------------
+   Every SEND_INTERVAL_MS it reads temperature + humidity from the AHT21,
+   feeds them to the ENS160 for compensation, reads AQI / TVOC / eCO2 and
+   sends everything in one small binary LoRa packet. The on-board LED
+   flashes on every transmission. Readings are also printed on USB Serial.
+  ============================================================================
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <RadioLib.h>
+
+// ============================ USER SETTINGS =================================
+#define NODE_ID           1          // change if you add more sensor nodes
+#define SEND_INTERVAL_MS  10000UL    // 10 s (use 60000 for normal operation)
+
+// ---- LoRa settings: MUST be identical on transmitter and receiver ----
+#define LORA_FREQ_MHZ     866.0      // India IN865 band: 865-867 MHz
+#define LORA_BW_KHZ       125.0
+#define LORA_SF           9          // 7 = faster/shorter range, 12 = slowest/longest
+#define LORA_CR           7          // coding rate 4/7
+#define LORA_SYNC_WORD    0x12       // private LoRa network
+#define LORA_TX_DBM       17         // 2..22 dBm
+#define LORA_PREAMBLE     8
+
+// AHT21 sits next to the ENS160's heater and can read a little warm.
+// Compare with a reference thermometer and put the difference here.
+#define TEMP_OFFSET_C     0.0f       // e.g. -1.5
+
+// I2C pins for the sensor
+#define I2C_SDA           4
+#define I2C_SCL           5
+// ============================================================================
+
+// ---- RP2040-LoRa on-board radio wiring (fixed, do not change) ----
+#define LORA_SCK   14
+#define LORA_MOSI  15
+#define LORA_MISO  24
+#define LORA_CS    13
+#define LORA_RST   23
+#define LORA_BUSY  18
+#define LORA_DIO1  16
+#define LORA_RXEN  17   // antenna switch: HIGH = receive, LOW = transmit
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 25
+#endif
+
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI1);
+
+// ---- Packet format (must match the receiver) ----
+struct __attribute__((packed)) WeatherPacket {
+  uint8_t  magic[2];    // 'W','X'
+  uint8_t  version;     // 1
+  uint8_t  nodeId;
+  uint16_t counter;     // increments every packet (receiver uses it to count losses)
+  int16_t  temp_c100;   // temperature  degC * 100
+  uint16_t hum_p100;    // humidity     %RH  * 100
+  uint8_t  aqi;         // ENS160 AQI-UBA 1..5 (0 = not available)
+  uint16_t tvoc_ppb;
+  uint16_t eco2_ppm;
+  uint8_t  ensValidity; // 0 normal, 1 warm-up, 2 initial start-up, 3 invalid
+  uint8_t  flags;       // bit0 = AHT21 ok, bit1 = ENS160 ok
+};
+
+#define FLAG_AHT_OK  0x01
+#define FLAG_ENS_OK  0x02
+
+uint16_t packetCounter = 0;
+bool ahtPresent = false;
+bool ensPresent = false;
+
+// ============================================================================
+//  AHT21 driver (temperature / humidity, I2C 0x38)
+// ============================================================================
+const uint8_t AHT_ADDR = 0x38;
+
+uint8_t ahtCrc8(const uint8_t *data, uint8_t len) {
+  uint8_t crc = 0xFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++) crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
+
+bool ahtBegin() {
+  delay(100);                                   // power-up time
+  Wire.beginTransmission(AHT_ADDR);
+  if (Wire.endTransmission() != 0) return false;
+
+  uint8_t status = 0;
+  if (Wire.requestFrom(AHT_ADDR, (size_t)1) == 1) status = Wire.read();
+  if (!(status & 0x08)) {                       // not calibrated -> send init
+    Wire.beginTransmission(AHT_ADDR);
+    Wire.write(0xBE); Wire.write(0x08); Wire.write(0x00);
+    Wire.endTransmission();
+    delay(10);
+  }
+  return true;
+}
+
+bool ahtRead(float &tempC, float &humPct) {
+  Wire.beginTransmission(AHT_ADDR);
+  Wire.write(0xAC); Wire.write(0x33); Wire.write(0x00);   // trigger measurement
+  if (Wire.endTransmission() != 0) return false;
+  delay(80);
+
+  uint8_t d[7];
+  bool ready = false;
+  for (uint8_t tries = 0; tries < 10 && !ready; tries++) {
+    if (Wire.requestFrom(AHT_ADDR, (size_t)7) != 7) return false;
+    for (uint8_t i = 0; i < 7; i++) d[i] = Wire.read();
+    ready = !(d[0] & 0x80);                    // bit7 = busy
+    if (!ready) delay(10);
+  }
+  if (!ready) return false;
+  if (ahtCrc8(d, 6) != d[6]) return false;
+
+  uint32_t rawH = ((uint32_t)d[1] << 12) | ((uint32_t)d[2] << 4) | (d[3] >> 4);
+  uint32_t rawT = (((uint32_t)d[3] & 0x0F) << 16) | ((uint32_t)d[4] << 8) | d[5];
+  humPct = rawH * 100.0f / 1048576.0f;
+  tempC  = rawT * 200.0f / 1048576.0f - 50.0f;
+  return true;
+}
+
+// ============================================================================
+//  ENS160 driver (air quality, I2C 0x53 or 0x52)
+// ============================================================================
+uint8_t ensAddr = 0;
+
+#define ENS_PART_ID     0x00
+#define ENS_OPMODE      0x10
+#define ENS_TEMP_IN     0x13
+#define ENS_STATUS      0x20
+#define ENS_MODE_IDLE   0x01
+#define ENS_MODE_STD    0x02
+
+bool ensWrite(uint8_t reg, const uint8_t *data, uint8_t len) {
+  Wire.beginTransmission(ensAddr);
+  Wire.write(reg);
+  Wire.write(data, len);
+  return Wire.endTransmission() == 0;
+}
+
+bool ensRead(uint8_t reg, uint8_t *data, uint8_t len) {
+  Wire.beginTransmission(ensAddr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(ensAddr, (size_t)len) != len) return false;
+  for (uint8_t i = 0; i < len; i++) data[i] = Wire.read();
+  return true;
+}
+
+bool ensBegin() {
+  const uint8_t candidates[2] = {0x53, 0x52};
+  for (uint8_t i = 0; i < 2; i++) {
+    ensAddr = candidates[i];
+    uint8_t id[2];
+    if (ensRead(ENS_PART_ID, id, 2) && (id[0] | (id[1] << 8)) == 0x0160) {
+      uint8_t m = ENS_MODE_IDLE;
+      ensWrite(ENS_OPMODE, &m, 1);
+      delay(20);
+      m = ENS_MODE_STD;
+      ensWrite(ENS_OPMODE, &m, 1);
+      delay(50);
+      return true;
+    }
+  }
+  ensAddr = 0;
+  return false;
+}
+
+// Give the ENS160 the real temperature/humidity so it can compensate
+void ensSetEnvironment(float tempC, float humPct) {
+  uint16_t t = (uint16_t)((tempC + 273.15f) * 64.0f + 0.5f);
+  uint16_t h = (uint16_t)(humPct * 512.0f + 0.5f);
+  uint8_t buf[4] = { (uint8_t)(t & 0xFF), (uint8_t)(t >> 8),
+                     (uint8_t)(h & 0xFF), (uint8_t)(h >> 8) };
+  ensWrite(ENS_TEMP_IN, buf, 4);   // TEMP_IN (0x13) + RH_IN (0x15)
+}
+
+bool ensReadData(uint8_t &aqi, uint16_t &tvoc, uint16_t &eco2, uint8_t &validity) {
+  uint8_t d[6];                      // STATUS, AQI, TVOC L/H, ECO2 L/H
+  if (!ensRead(ENS_STATUS, d, 6)) return false;
+  validity = (d[0] >> 2) & 0x03;
+  aqi  = d[1] & 0x07;
+  tvoc = d[2] | (d[3] << 8);
+  eco2 = d[4] | (d[5] << 8);
+  return true;
+}
+
+// ============================================================================
+//  Radio
+// ============================================================================
+bool radioBegin() {
+  SPI1.setRX(LORA_MISO);
+  SPI1.setSCK(LORA_SCK);
+  SPI1.setTX(LORA_MOSI);
+  SPI1.begin();
+
+  // RP2040-LoRa uses a crystal (no TCXO) -> tcxoVoltage = 0
+  int state = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                          LORA_SYNC_WORD, LORA_TX_DBM, LORA_PREAMBLE, 0.0, false);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] begin without TCXO failed (%d), retrying with 1.8V TCXO\n", state);
+    state = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR,
+                        LORA_SYNC_WORD, LORA_TX_DBM, LORA_PREAMBLE, 1.8, false);
+  }
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] init FAILED, code %d\n", state);
+    return false;
+  }
+
+  // Antenna switch: DIO2 drives one side, GP17 the other (complementary)
+  radio.setDio2AsRfSwitch(true);
+  radio.setRfSwitchPins(LORA_RXEN, RADIOLIB_NC);
+  return true;
+}
+
+// ============================================================================
+void blink(uint16_t ms) {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(ms);
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) { }   // wait up to 3 s for USB serial
+
+  Serial.println();
+  Serial.println(F("=== LoRa Weather Station - TRANSMITTER ==="));
+
+  Wire.setSDA(I2C_SDA);
+  Wire.setSCL(I2C_SCL);
+  Wire.begin();
+  Wire.setClock(100000);
+
+  ahtPresent = ahtBegin();
+  ensPresent = ensBegin();
+  Serial.printf("AHT21 : %s\n", ahtPresent ? "OK (0x38)" : "NOT FOUND");
+  if (ensPresent) Serial.printf("ENS160: OK (0x%02X)\n", ensAddr);
+  else            Serial.println(F("ENS160: NOT FOUND"));
+
+  if (!radioBegin()) {
+    // Fast blink forever = radio problem
+    while (true) { blink(100); delay(100); }
+  }
+  Serial.printf("LoRa  : OK  %.1f MHz  SF%d  BW%.0f  %d dBm\n",
+                LORA_FREQ_MHZ, LORA_SF, LORA_BW_KHZ, LORA_TX_DBM);
+  Serial.println(F("Note: ENS160 needs ~3 min warm-up after power-on (and ~1 h the very first time)."));
+}
+
+void loop() {
+  static uint32_t lastSend = 0;
+  if (lastSend != 0 && millis() - lastSend < SEND_INTERVAL_MS) return;
+  lastSend = millis();
+  if (lastSend == 0) lastSend = 1;
+
+  // Retry sensors that were missing at boot (loose wire etc.)
+  if (!ahtPresent) ahtPresent = ahtBegin();
+  if (!ensPresent) ensPresent = ensBegin();
+
+  WeatherPacket pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  pkt.magic[0] = 'W';
+  pkt.magic[1] = 'X';
+  pkt.version  = 1;
+  pkt.nodeId   = NODE_ID;
+  pkt.counter  = packetCounter++;
+  pkt.ensValidity = 3;
+
+  float tempC = 0, humPct = 0;
+  if (ahtPresent && ahtRead(tempC, humPct)) {
+    float tComp = tempC;                    // raw value for ENS160 compensation
+    tempC += TEMP_OFFSET_C;
+    pkt.temp_c100 = (int16_t)lroundf(tempC * 100.0f);
+    pkt.hum_p100  = (uint16_t)lroundf(humPct * 100.0f);
+    pkt.flags |= FLAG_AHT_OK;
+    if (ensPresent) ensSetEnvironment(tComp, humPct);
+  }
+
+  if (ensPresent) {
+    uint8_t aqi, validity;
+    uint16_t tvoc, eco2;
+    if (ensReadData(aqi, tvoc, eco2, validity)) {
+      pkt.aqi = aqi;
+      pkt.tvoc_ppb = tvoc;
+      pkt.eco2_ppm = eco2;
+      pkt.ensValidity = validity;
+      pkt.flags |= FLAG_ENS_OK;
+    } else {
+      ensPresent = false;                   // try to re-detect next time
+    }
+  }
+
+  digitalWrite(LED_BUILTIN, HIGH);
+  int state = radio.transmit((uint8_t *)&pkt, sizeof(pkt));
+  digitalWrite(LED_BUILTIN, LOW);
+
+  static const char *validityText[] = {"OK", "warm-up", "start-up", "invalid"};
+  Serial.printf("#%u  T=%.2fC  H=%.1f%%  AQI=%u  TVOC=%uppb  eCO2=%uppm  [%s]  -> ",
+                pkt.counter, pkt.temp_c100 / 100.0f, pkt.hum_p100 / 100.0f,
+                pkt.aqi, pkt.tvoc_ppb, pkt.eco2_ppm, validityText[pkt.ensValidity & 3]);
+  if (state == RADIOLIB_ERR_NONE) Serial.println(F("sent"));
+  else                            Serial.printf("TX error %d\n", state);
+}
